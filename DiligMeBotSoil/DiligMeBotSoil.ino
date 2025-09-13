@@ -58,7 +58,7 @@ httpd_handle_t stream_httpd = NULL;
 
 // --- Interval control for snapshots ---
 unsigned long lastCaptureTime = 0;
-const unsigned long captureInterval = 1UL * 10UL * 1000UL; // 10 minutes
+const unsigned long captureInterval = 1UL * 30UL * 1000UL; // 10 minutes
 
 // --- Capture handler (returns base64 jpeg inside JSON) ---
 static esp_err_t capture_handler(httpd_req_t *req){
@@ -243,9 +243,9 @@ void setup() {
 void loop() {
   int moistureState = digitalRead(SOIL_MOISTURE_PIN);
   if (moistureState == HIGH) {
-    digitalWrite(SOIL_DRY_SIGNAL_PIN, HIGH);
-  } else {
     digitalWrite(SOIL_DRY_SIGNAL_PIN, LOW);
+  } else {
+    digitalWrite(SOIL_DRY_SIGNAL_PIN, HIGH);
   }
   delay(1000);
 }
