@@ -4,15 +4,16 @@
 #include "img_converters.h"
 #include "Arduino.h"
 #include "fb_gfx.h"
-#include "soc/soc.h" //disable brownout problems
-#include "soc/rtc_cntl_reg.h"  //disable brownout problems
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 #include "esp_http_server.h"
 
 // --- New Libraries for DS18B20 ---
 #include <OneWire.h>
 #include <DallasTemperature.h>
+#include <base64.h>  // for encoding JPEG into JSON-safe string
 
-//Replace with your network credentials
+// Replace with your network credentials
 const char* ssid = "PLDTHOMEFIBRB74t8";
 const char* password = "PLDTWIFIcnRg9";
 
@@ -57,90 +58,93 @@ httpd_handle_t stream_httpd = NULL;
 
 // --- Interval control for snapshots ---
 unsigned long lastCaptureTime = 0;
-// NOTE: set to 10 minutes (change to 30UL*1000UL for 30 seconds)
-const unsigned long captureInterval = 10UL * 60UL * 1000UL; // 10 minutes
+const unsigned long captureInterval = 1UL * 10UL * 1000UL; // 10 minutes
 
-// --- Snapshot handler ---
+// --- Capture handler (returns base64 jpeg inside JSON) ---
 static esp_err_t capture_handler(httpd_req_t *req){
   unsigned long now = millis();
+  httpd_resp_set_type(req, "application/json");
 
   if (now - lastCaptureTime < captureInterval) {
-    String msg = "Please wait before next capture. Remaining: " +
-                 String((captureInterval - (now - lastCaptureTime)) / 1000) + " seconds";
-    httpd_resp_send(req, msg.c_str(), msg.length());
+    String json = "{\"status\":\"wait\",\"remaining\":" + 
+                  String((captureInterval - (now - lastCaptureTime)) / 1000) + "}";
+    httpd_resp_send(req, json.c_str(), json.length());
     return ESP_OK;
   }
 
-  // Turn flash ON
   digitalWrite(FLASH_LED_PIN, HIGH);
-  delay(200); // allow camera to adjust
+  delay(200);
 
   camera_fb_t * fb = esp_camera_fb_get();
   if (!fb) {
-    Serial.println("Failed to get FB");
-    httpd_resp_send_500(req);
-    // Turn flash OFF even on failure
     digitalWrite(FLASH_LED_PIN, LOW);
+    String json = "{\"error\":\"Failed to capture image\"}";
+    httpd_resp_send(req, json.c_str(), json.length());
     return ESP_FAIL;
   }
 
-  httpd_resp_set_type(req, "image/jpeg");
-  httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
-  httpd_resp_send(req, (const char *)fb->buf, fb->len);
+  // Encode JPEG buffer to Base64 string
+  String imageBase64 = base64::encode((uint8_t*)fb->buf, fb->len);
+
+  String json = "{\"status\":\"ok\",\"image\":\"" + imageBase64 + "\"}";
+  httpd_resp_send(req, json.c_str(), json.length());
 
   esp_camera_fb_return(fb);
-
-  // Turn flash OFF
   digitalWrite(FLASH_LED_PIN, LOW);
-
   lastCaptureTime = now;
   return ESP_OK;
 }
 
-// --- DS18B20 temperature handler ---
+// --- Temperature handler ---
 static esp_err_t temperature_handler(httpd_req_t *req){
+  httpd_resp_set_type(req, "application/json");
   sensors.requestTemperatures();
   float tempC = sensors.getTempCByIndex(0);
-  String message;
+  String json;
   if (tempC == DEVICE_DISCONNECTED_C) {
-    message = "Error: DS18B20 not detected";
+    json = "{\"temperature\":\"error\"}";
   } else {
-    message = "Soil Temperature: " + String(tempC) + " °C";
+    json = "{\"temperature\":" + String(tempC, 2) + "}";
   }
-  httpd_resp_send(req, message.c_str(), message.length());
+  httpd_resp_send(req, json.c_str(), json.length());
   return ESP_OK;
 }
 
-// --- Soil Moisture handler ---
+// --- Moisture handler ---
 static esp_err_t moisture_handler(httpd_req_t *req){
+  httpd_resp_set_type(req, "application/json");
   int moistureState = digitalRead(SOIL_MOISTURE_PIN);
-  String message;
+  String json;
 
-  if (moistureState == HIGH) {   // dry
-    message = "Soil Moisture: DRY";
-    digitalWrite(SOIL_DRY_SIGNAL_PIN, HIGH);  // signal ON
-  } else {                       // wet
-    message = "Soil Moisture: WET";
-    digitalWrite(SOIL_DRY_SIGNAL_PIN, LOW);   // signal OFF
+  if (moistureState == HIGH) {
+    digitalWrite(SOIL_DRY_SIGNAL_PIN, HIGH);
+    json = "{\"moisture\":\"dry\"}";
+  } else {
+    digitalWrite(SOIL_DRY_SIGNAL_PIN, LOW);
+    json = "{\"moisture\":\"wet\"}";
   }
 
-  httpd_resp_send(req, message.c_str(), message.length());
+  httpd_resp_send(req, json.c_str(), json.length());
   return ESP_OK;
 }
 
-// --- Index page handler ---
+// --- Index summary handler ---
 static esp_err_t index_handler(httpd_req_t *req){
-  const char* resp_str =
-    "<html>"
-    "<head><title>ESP32-CAM Sensor Hub</title></head>"
-    "<body>"
-    "<h2>ESP32-CAM Sensor Hub</h2>"
-    "<p><a href=\"/capture\">Take Photo (every 10 mins)</a></p>"
-    "<p><a href=\"/temperature\">Check Soil Temperature</a></p>"
-    "<p><a href=\"/moisture\">Check Soil Moisture</a></p>"
-    "</body>"
-    "</html>";
-  httpd_resp_send(req, resp_str, strlen(resp_str));
+  httpd_resp_set_type(req, "application/json");
+
+  sensors.requestTemperatures();
+  float tempC = sensors.getTempCByIndex(0);
+  int moistureState = digitalRead(SOIL_MOISTURE_PIN);
+
+  String json = "{";
+  json += "\"temperature\":";
+  json += (tempC == DEVICE_DISCONNECTED_C) ? "\"error\"" : String(tempC, 2);
+  json += ",";
+  json += "\"moisture\":\"";
+  json += (moistureState == HIGH) ? "dry" : "wet";
+  json += "\"}";
+  
+  httpd_resp_send(req, json.c_str(), json.length());
   return ESP_OK;
 }
 
@@ -148,33 +152,10 @@ void startCameraServer(){
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
 
-  httpd_uri_t index_page = {
-    .uri       = "/",
-    .method    = HTTP_GET,
-    .handler   = index_handler,
-    .user_ctx  = NULL
-  };
-
-  httpd_uri_t capture_uri = {
-    .uri       = "/capture",
-    .method    = HTTP_GET,
-    .handler   = capture_handler,
-    .user_ctx  = NULL
-  };
-
-  httpd_uri_t temp_uri = {
-    .uri       = "/temperature",
-    .method    = HTTP_GET,
-    .handler   = temperature_handler,
-    .user_ctx  = NULL
-  };
-
-  httpd_uri_t moist_uri = {
-    .uri       = "/moisture",
-    .method    = HTTP_GET,
-    .handler   = moisture_handler,
-    .user_ctx  = NULL
-  };
+  httpd_uri_t index_page = { .uri="/", .method=HTTP_GET, .handler=index_handler };
+  httpd_uri_t capture_uri = { .uri="/capture", .method=HTTP_GET, .handler=capture_handler };
+  httpd_uri_t temp_uri = { .uri="/temperature", .method=HTTP_GET, .handler=temperature_handler };
+  httpd_uri_t moist_uri = { .uri="/moisture", .method=HTTP_GET, .handler=moisture_handler };
 
   if (httpd_start(&stream_httpd, &config) == ESP_OK) {
     httpd_register_uri_handler(stream_httpd, &index_page);
@@ -187,12 +168,11 @@ void startCameraServer(){
 }
 
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); //disable brownout detector
- 
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
   Serial.begin(115200);
   Serial.setDebugOutput(true);
 
-  // Setup sensor pins
   pinMode(ONE_WIRE_BUS, INPUT_PULLUP);     
   pinMode(SOIL_MOISTURE_PIN, INPUT_PULLUP);
   pinMode(FLASH_LED_PIN, OUTPUT);
@@ -200,10 +180,8 @@ void setup() {
   pinMode(SOIL_DRY_SIGNAL_PIN, OUTPUT);
   digitalWrite(SOIL_DRY_SIGNAL_PIN, LOW);
 
-  // Sensors
   sensors.begin();
 
-  // Camera config
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -230,22 +208,17 @@ void setup() {
     config.frame_size = FRAMESIZE_SVGA;
     config.jpeg_quality = 15;
     config.fb_count = 1;
-    Serial.println("PSRAM found: using fb_count=1");
   } else {
     config.frame_size = FRAMESIZE_QVGA;
     config.jpeg_quality = 35;
     config.fb_count = 1;
-    Serial.println("No PSRAM: using fb_count=1");
   }
   
-  // Init camera
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x\n", err);
+  if (esp_camera_init(&config) != ESP_OK) {
+    Serial.println("Camera init failed");
     return;
   }
 
-  // Wi-Fi connection
   WiFi.begin(ssid, password);
   Serial.print("Connecting to WiFi");
   unsigned long wifiStart = millis();
@@ -268,13 +241,11 @@ void setup() {
 }
 
 void loop() {
-  // Keep soil dry signal updated continuously
   int moistureState = digitalRead(SOIL_MOISTURE_PIN);
   if (moistureState == HIGH) {
-    digitalWrite(SOIL_DRY_SIGNAL_PIN, HIGH); // dry
-    Serial.println("WATERED");
+    digitalWrite(SOIL_DRY_SIGNAL_PIN, HIGH);
   } else {
-    digitalWrite(SOIL_DRY_SIGNAL_PIN, LOW);  // wet
+    digitalWrite(SOIL_DRY_SIGNAL_PIN, LOW);
   }
   delay(1000);
 }
